@@ -16,7 +16,6 @@ function Get-Profiles {
             Write-Host "Warning: Failed to load profiles from JSON. Using defaults." -ForegroundColor Yellow
         }
     }
-    # Initial defaults
     return @{
         "personal" = @{ "name" = "personal"; "email" = "personal@gmail.com"; "ssh" = "~/.ssh/id_rsa_personal" }
         "work"     = @{ "name" = "work"; "email" = "worke@gmail.com"; "ssh" = "~/.ssh/id_rsa_work" }
@@ -34,7 +33,6 @@ function Update-SSHConfig {
     $fullKeyPath = [System.IO.Path]::GetFullPath($SSHPath.Replace("~", $env:USERPROFILE))
     $hostAlias = "github.com-$ProfileName"
     
-    # Ensure .ssh directory exists
     $sshDir = Split-Path $sshConfigPath
     if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Path $sshDir -Force }
     if (-not (Test-Path $sshConfigPath)) { New-Item -ItemType File -Path $sshConfigPath -Force }
@@ -43,7 +41,6 @@ function Update-SSHConfig {
     $entry = "`nHost $hostAlias`n    HostName github.com`n    User git`n    IdentityFile `"$fullKeyPath`"`n    IdentitiesOnly yes`n"
 
     if ($configContent -match "Host $hostAlias(\s|$)") {
-        # Update existing entry
         $escapedPath = [regex]::Escape($fullKeyPath)
         if ($configContent -notmatch "IdentityFile\s+`"$escapedPath`"") {
             Write-Host "Note: SSH config entry for $hostAlias exists but may have a different key." -ForegroundColor Yellow
@@ -58,7 +55,6 @@ function Update-SSHConfig {
 function Test-GitHubIdentity {
     param ($HostAlias)
     Write-Host "`nVerifying Identity for $HostAlias..." -ForegroundColor Cyan
-    # Use -o ConnectTimeout to avoid hanging
     $testResult = ssh -T -o "ConnectTimeout=5" -o "StrictHostKeyChecking=no" $HostAlias 2>&1 | Out-String
     if ($testResult -match "Hi (.*)!") {
         $username = $matches[1]
@@ -78,10 +74,7 @@ function New-SSHKey {
     if ($confirm -eq 'y') {
         $dir = Split-Path $fullPath
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force }
-        
-        # -a 100 for enhanced security
         ssh-keygen -t ed25519 -a 100 -C "$Email" -f "$fullPath" -N '""'
-        
         $pubKey = (Get-Content "$fullPath.pub" -Raw).Trim()
         Write-Host "`nSuccessfully generated key and copied public key to clipboard." -ForegroundColor Green
         $pubKey | Set-Clipboard
@@ -90,12 +83,34 @@ function New-SSHKey {
     return $false
 }
 
+# --- Update Remote URLs in a Repo ---
+function Update-RepoRemotes {
+    param ($RepoDir, $ProfileName)
+    $prevLocation = Get-Location
+    Set-Location $RepoDir
+    $remotes = git remote 2>$null
+    $updated = 0
+    foreach ($remote in $remotes) {
+        $currentUrl = git remote get-url $remote 2>$null
+        if ($currentUrl -match "https://github\.com/(.+)" -or $currentUrl -match "git@github\.com:(.+)") {
+            $repoPath = $matches[1]
+            $newUrl = "git@github.com-" + $ProfileName + ":" + $repoPath
+            git remote set-url $remote $newUrl
+            Write-Host "  [Updated] $remote" -ForegroundColor Green
+            Write-Host "    Before: $currentUrl" -ForegroundColor Gray
+            Write-Host "    After:  $newUrl" -ForegroundColor Cyan
+            $updated++
+        }
+    }
+    Set-Location $prevLocation
+    return $updated
+}
+
 # --- Main Switch Logic ---
 function Switch-GitAccount {
     param ($ProfileName, $Profiles)
     $selected = $Profiles[$ProfileName]
     
-    # Choice: Local or Global
     Write-Host "`nSwitching to [$ProfileName] ($($selected.email))" -ForegroundColor Magenta
     $scopeChoice = Read-Host "Apply to: (1) Global (Full PC)  (2) Local (Current Repo only)"
     $scope = if ($scopeChoice -eq "2") { "--local" } else { "--global" }
@@ -109,7 +124,7 @@ function Switch-GitAccount {
     git config $scope user.name $selected.name
     git config $scope user.email $selected.email
 
-    # 2. SSH Agent (V1 fallback/complement)
+    # 2. SSH Agent
     $agentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
     if ($agentService -and $agentService.Status -eq "Running") {
         ssh-add -D 2>$null
@@ -118,10 +133,42 @@ function Switch-GitAccount {
         if (Test-Path $fullSSHPath) { ssh-add $fullSSHPath 2>$null }
     }
 
-    # 3. SSH Config Alias (The stable V2 way)
+    # 3. SSH Config Alias
     Update-SSHConfig -ProfileName $ProfileName -SSHPath $selected.ssh
 
-    # 4. Show Result & Verify
+    # 4. Remote URL Update
+    Write-Host "`n[Remote URL Update]" -ForegroundColor Cyan
+    Write-Host "Enter the repo path(s) to update remote URLs to SSH alias." -ForegroundColor White
+    Write-Host "  - Separate multiple paths with ';'" -ForegroundColor Gray
+    Write-Host "  - You can drag & drop a folder into this window" -ForegroundColor Gray
+    Write-Host "  - Press Enter to skip" -ForegroundColor Gray
+    $repoPaths = Read-Host "Repo path(s)"
+
+    if (-not [string]::IsNullOrWhiteSpace($repoPaths)) {
+        $paths = $repoPaths -split ";" | ForEach-Object { $_.Trim().Trim('"').Trim("'") }
+        foreach ($repoDir in $paths) {
+            if (Test-Path $repoDir) {
+                $prevLocation = Get-Location
+                Set-Location $repoDir
+                if (git rev-parse --is-inside-work-tree 2>$null) {
+                    Write-Host "`nRepo: $repoDir" -ForegroundColor Yellow
+                    $count = Update-RepoRemotes -RepoDir $repoDir -ProfileName $ProfileName
+                    if ($count -eq 0) {
+                        Write-Host "  No remotes needed updating." -ForegroundColor Gray
+                    }
+                } else {
+                    Write-Host "  Not a Git repository: $repoDir" -ForegroundColor Red
+                }
+                Set-Location $prevLocation
+            } else {
+                Write-Host "  Path not found: $repoDir" -ForegroundColor Red
+            }
+        }
+    } else {
+        Write-Host "  Skipped remote URL update." -ForegroundColor Gray
+    }
+
+    # 5. Show Result
     Write-Host "`nSettings Applied ($scope):" -ForegroundColor Green
     Write-Host "  Name:  $($selected.name)"
     Write-Host "  Email: $($selected.email)"
@@ -184,7 +231,6 @@ if ($args.Count -eq 0) {
         if ($choice -eq ($i+3)) { break }
         
         if ($choice -eq $i) {
-            # Add Logic
             $newName = Read-Host "Profile Label (e.g. freelance)"
             $userName = Read-Host "Git user.name"
             $userEmail = Read-Host "Git user.email"
@@ -196,7 +242,6 @@ if ($args.Count -eq 0) {
             Switch-GitAccount -ProfileName $newName -Profiles $allProfiles
             Read-Host "`nDone. Press Enter to return to menu..."
         } elseif ($choice -eq ($i+1)) {
-            # Delete Logic
             $target = Read-Host "Enter Profile Name or Number to DELETE"
             $deleteKey = $null
             if ($target -match '^\d+$' -and [int]$target -le $keys.Count) {
