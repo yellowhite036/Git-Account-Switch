@@ -126,11 +126,20 @@ function Switch-GitAccount {
 
     # 2. SSH Agent
     $agentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
-    if ($agentService -and $agentService.Status -eq "Running") {
-        ssh-add -D 2>$null
-        $fullSSHPath = [System.IO.Path]::GetFullPath($selected.ssh.Replace("~", $env:USERPROFILE))
-        if (-not (Test-Path $fullSSHPath)) { New-SSHKey -Path $selected.ssh -Email $selected.email }
-        if (Test-Path $fullSSHPath) { ssh-add $fullSSHPath 2>$null }
+    if ($agentService.Status -ne "Running") {
+        Start-Service ssh-agent
+    }
+
+    ssh-add -D 2>$null
+
+    $fullSSHPath = [System.IO.Path]::GetFullPath($selected.ssh.Replace("~", $env:USERPROFILE))
+
+    if (-not (Test-Path $fullSSHPath)) {
+        New-SSHKey -Path $selected.ssh -Email $selected.email
+    }
+
+    if (Test-Path $fullSSHPath) {
+        ssh-add $fullSSHPath 2>$null
     }
 
     # 3. SSH Config Alias
