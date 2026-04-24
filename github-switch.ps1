@@ -11,14 +11,23 @@ $sshConfigPath = Join-Path $env:USERPROFILE ".ssh\config"
 function Get-Profiles {
     if (Test-Path $profilesPath) {
         try {
-            return Get-Content $profilesPath | ConvertFrom-Json -AsHashtable
+            $json = Get-Content $profilesPath -Raw | ConvertFrom-Json
+            $result = @{}
+            foreach ($prop in $json.PSObject.Properties) {
+                $result[$prop.Name] = @{
+                    "name"  = $prop.Value.name
+                    "email" = $prop.Value.email
+                    "ssh"   = $prop.Value.ssh
+                }
+            }
+            if ($result.Count -gt 0) { return $result }
         } catch {
             Write-Host "Warning: Failed to load profiles from JSON. Using defaults." -ForegroundColor Yellow
         }
     }
     return @{
         "personal" = @{ "name" = "personal"; "email" = "personal@gmail.com"; "ssh" = "~/.ssh/id_rsa_personal" }
-        "work"     = @{ "name" = "work"; "email" = "worke@gmail.com"; "ssh" = "~/.ssh/id_rsa_work" }
+        "work"     = @{ "name" = "work"; "email" = "work@gmail.com"; "ssh" = "~/.ssh/id_rsa_work" }
     }
 }
 
@@ -32,7 +41,7 @@ function Update-SSHConfig {
     param ($ProfileName, $SSHPath)
     $fullKeyPath = [System.IO.Path]::GetFullPath($SSHPath.Replace("~", $env:USERPROFILE))
     $hostAlias = "github.com-$ProfileName"
-    
+
     $sshDir = Split-Path $sshConfigPath
     if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Path $sshDir -Force }
     if (-not (Test-Path $sshConfigPath)) { New-Item -ItemType File -Path $sshConfigPath -Force }
@@ -57,7 +66,7 @@ function Test-GitHubIdentity {
     Write-Host "`nVerifying Identity for $HostAlias..." -ForegroundColor Cyan
     $testResult = ssh -T -o "ConnectTimeout=5" -o "StrictHostKeyChecking=no" $HostAlias 2>&1 | Out-String
     if ($testResult -match "Hi (.*)!") {
-        $username = $matches[1]
+        $username = $matches[1].ToLower()
         Write-Host "Verified! You are authenticated as: [$username]" -ForegroundColor Green
     } else {
         Write-Host "Verification Failed. Result:" -ForegroundColor Yellow
@@ -74,10 +83,15 @@ function New-SSHKey {
     if ($confirm -eq 'y') {
         $dir = Split-Path $fullPath
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force }
-        ssh-keygen -t ed25519 -a 100 -C "$Email" -f "$fullPath" -N '""'
+        ssh-keygen -t ed25519 -a 100 -C "$Email" -f "$fullPath" --% -N ""
         $pubKey = (Get-Content "$fullPath.pub" -Raw).Trim()
-        Write-Host "`nSuccessfully generated key and copied public key to clipboard." -ForegroundColor Green
         $pubKey | Set-Clipboard
+        Write-Host "`n========== Public Key (Copy and paste to GitHub) ==========" -ForegroundColor Cyan
+        Write-Host $pubKey -ForegroundColor White
+        Write-Host "============================================================" -ForegroundColor Cyan
+        Write-Host "(Copied to clipboard automatically)" -ForegroundColor Gray
+        Write-Host "Add it here: https://github.com/settings/ssh/new" -ForegroundColor Yellow
+        Read-Host "`nPress Enter after adding the key to GitHub"
         return $true
     }
     return $false
@@ -110,7 +124,7 @@ function Update-RepoRemotes {
 function Switch-GitAccount {
     param ($ProfileName, $Profiles)
     $selected = $Profiles[$ProfileName]
-    
+
     Write-Host "`nSwitching to [$ProfileName] ($($selected.email))" -ForegroundColor Magenta
     $scopeChoice = Read-Host "Apply to: (1) Global (Full PC)  (2) Local (Current Repo only)"
     $scope = if ($scopeChoice -eq "2") { "--local" } else { "--global" }
@@ -149,12 +163,12 @@ function Switch-GitAccount {
     Write-Host "`n[Remote URL Update]" -ForegroundColor Cyan
     Write-Host "Enter the repo path(s) to update remote URLs to SSH alias." -ForegroundColor White
     Write-Host "  - Separate multiple paths with ';'" -ForegroundColor Gray
-    Write-Host "  - You can drag & drop a folder into this window" -ForegroundColor Gray
+    Write-Host "  - You can drag and drop a folder into this window" -ForegroundColor Gray
     Write-Host "  - Press Enter to skip" -ForegroundColor Gray
     $repoPaths = Read-Host "Repo path(s)"
 
     if (-not [string]::IsNullOrWhiteSpace($repoPaths)) {
-        $paths = $repoPaths -split ";" | ForEach-Object { $_.Trim().Trim('"').Trim("'") }
+        $paths = $repoPaths -split ";" | ForEach-Object { $_.Trim().Trim('"') }
         foreach ($repoDir in $paths) {
             if (Test-Path $repoDir) {
                 $prevLocation = Get-Location
@@ -182,17 +196,91 @@ function Switch-GitAccount {
     Write-Host "  Name:  $($selected.name)"
     Write-Host "  Email: $($selected.email)"
     Write-Host "  SSH Alias: github.com-$ProfileName" -ForegroundColor Gray
-    
+
     Test-GitHubIdentity -HostAlias "github.com-$ProfileName"
-    
+
     Write-Host "`n[Note] For new clones, use the alias:" -ForegroundColor Cyan
-    Write-Host "git clone git@github.com-$ProfileName:user/repo.git" -ForegroundColor White
+    Write-Host "git clone git@github.com-${ProfileName}:user/repo.git" -ForegroundColor White
+}
+
+# --- Reload All Keys ---
+function Reload-AllKeys {
+    param ($Profiles)
+    $agentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
+    if ($agentService.Status -ne "Running") {
+        Start-Service ssh-agent
+    }
+    ssh-add -D 2>$null
+    Write-Host "`n[Reloading All SSH Keys]" -ForegroundColor Cyan
+    $count = 0
+    foreach ($key in $Profiles.Keys) {
+        $profile = $Profiles[$key]
+        $fullPath = [System.IO.Path]::GetFullPath($profile.ssh.Replace("~", $env:USERPROFILE))
+        if (Test-Path $fullPath) {
+            ssh-add $fullPath 2>$null
+            Write-Host "  [OK] $key => $fullPath" -ForegroundColor Green
+            $count++
+        } else {
+            Write-Host "  [SKIP] $key => key not found at $fullPath" -ForegroundColor Yellow
+        }
+    }
+    Write-Host "`n$count key(s) loaded." -ForegroundColor Cyan
+}
+
+# --- Show Public Key ---
+function Show-PublicKey {
+    param ($Profiles)
+    Write-Host "`n[Show Public Key]" -ForegroundColor Cyan
+    Write-Host "Select a profile:" -ForegroundColor White
+    $i = 1
+    $keys = $Profiles.Keys | Sort-Object
+    foreach ($k in $keys) {
+        Write-Host "$i. $k ($($Profiles[$k].email))"
+        $i++
+    }
+    $choice = Read-Host "Select (Number or Name)"
+    $selectedKey = $null
+    if ($choice -match '^\d+$' -and [int]$choice -le $keys.Count) {
+        $selectedKey = $keys[[int]$choice-1]
+    } elseif ($Profiles.ContainsKey($choice)) {
+        $selectedKey = $choice
+    }
+
+    if ($selectedKey) {
+        $profile = $Profiles[$selectedKey]
+        $fullPath = [System.IO.Path]::GetFullPath($profile.ssh.Replace("~", $env:USERPROFILE))
+        $pubPath = "$fullPath.pub"
+        if (Test-Path $pubPath) {
+            $pubKey = (Get-Content $pubPath -Raw).Trim()
+            $pubKey | Set-Clipboard
+            Write-Host "`n========== Public Key for [$selectedKey] ==========" -ForegroundColor Cyan
+            Write-Host $pubKey -ForegroundColor White
+            Write-Host "====================================================" -ForegroundColor Cyan
+            Write-Host "(Copied to clipboard automatically)" -ForegroundColor Gray
+            Write-Host "Add it here: https://github.com/settings/ssh/new" -ForegroundColor Yellow
+        } else {
+            Write-Host "Public key not found at: $pubPath" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "Profile not found." -ForegroundColor Red
+    }
+}
+
+# --- Clear All Keys ---
+function Clear-AllKeys {
+    $agentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
+    if ($agentService.Status -ne "Running") {
+        Start-Service ssh-agent
+    }
+    ssh-add -D 2>$null
+    Write-Host "`n[All SSH Keys Cleared]" -ForegroundColor Yellow
+    Write-Host "SSH Agent is now empty." -ForegroundColor Gray
 }
 
 # --- Status Check ---
 function Show-CurrentStatus {
-    Write-Host "`n=== Current Git & SSH Status ===" -ForegroundColor Cyan
-    
+    Write-Host "`n=== Current Git and SSH Status ===" -ForegroundColor Cyan
+
     Write-Host "[Local Config] (Current Repo)" -ForegroundColor Yellow
     if (git rev-parse --is-inside-work-tree 2>$null) {
         Write-Host "  Name:  $(git config --local user.name)"
@@ -233,19 +321,22 @@ if ($args.Count -eq 0) {
         Write-Host "$i. [ADD NEW PROFILE]"
         Write-Host "$($i+1). [DELETE PROFILE]"
         Write-Host "$($i+2). [CHECK CURRENT STATUS]"
-        Write-Host "$($i+3). [EXIT]"
-        
+        Write-Host "$($i+3). [RELOAD ALL KEYS]"
+        Write-Host "$($i+4). [CLEAR ALL KEYS]"
+        Write-Host "$($i+5). [SHOW PUBLIC KEY]"
+        Write-Host "$($i+6). [EXIT]"
+
         $choice = Read-Host "`nSelect (Number or Name)"
-        
-        if ($choice -eq ($i+3)) { break }
-        
+
+        if ($choice -eq ($i+6)) { break }
+
         if ($choice -eq $i) {
             $newName = Read-Host "Profile Label (e.g. freelance)"
             $userName = Read-Host "Git user.name"
             $userEmail = Read-Host "Git user.email"
             $sshPath = Read-Host "SSH Key Path (Default: ~/.ssh/id_ed25519_$newName)"
             if ([string]::IsNullOrWhiteSpace($sshPath)) { $sshPath = "~/.ssh/id_ed25519_$newName" }
-            
+
             $allProfiles[$newName] = @{ "name" = $userName; "email" = $userEmail; "ssh" = $sshPath }
             Save-Profiles -Profiles $allProfiles
             Switch-GitAccount -ProfileName $newName -Profiles $allProfiles
@@ -272,6 +363,15 @@ if ($args.Count -eq 0) {
             Read-Host "`nPress Enter to return to menu..."
         } elseif ($choice -eq ($i+2)) {
             Show-CurrentStatus
+            Read-Host "`nPress Enter to return to menu..."
+        } elseif ($choice -eq ($i+3)) {
+            Reload-AllKeys -Profiles $allProfiles
+            Read-Host "`nPress Enter to return to menu..."
+        } elseif ($choice -eq ($i+4)) {
+            Clear-AllKeys
+            Read-Host "`nPress Enter to return to menu..."
+        } elseif ($choice -eq ($i+5)) {
+            Show-PublicKey -Profiles $allProfiles
             Read-Host "`nPress Enter to return to menu..."
         } elseif ($choice -match '^\d+$' -and [int]$choice -le $keys.Count) {
             Switch-GitAccount -ProfileName $keys[[int]$choice-1] -Profiles $allProfiles

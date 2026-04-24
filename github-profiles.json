@@ -1,0 +1,17 @@
+{
+    "work":  {
+                 "email":  "work@gmail.com",
+                 "name":  "work",
+                 "ssh":  "~/.ssh/id_rsa_work"
+             },
+    "12121":  {
+                  "email":  "12121",
+                  "name":  "121212",
+                  "ssh":  "~/.ssh/id_ed25519_12121"
+              },
+    "personal":  {
+                     "email":  "personal@gmail.com",
+                     "name":  "personal",
+                     "ssh":  "~/.ssh/id_rsa_personal"
+                 }
+}
