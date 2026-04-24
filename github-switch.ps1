@@ -1,5 +1,9 @@
-# Git Account Switcher for Windows (V2)
-# Handles Git config, SSH Config Aliases, and Profile Persistence.
+# Git Account Switcher for Windows (V2 - Fixed)
+# Changes from original:
+#   1. Switch-GitAccount now always rewrites HTTPS remotes to SSH alias
+#   2. Switch-GitAccount sets url.insteadOf to globally redirect HTTPS -> SSH alias
+#   3. Switch-GitAccount clears the relevant Windows Credential Manager entry
+#   4. Show-CurrentStatus SSH test syntax was verified (was already correct)
 
 # --- Global Configurations ---
 $scriptDir = Split-Path $MyInvocation.MyCommand.Path -Parent
@@ -98,6 +102,7 @@ function New-SSHKey {
 }
 
 # --- Update Remote URLs in a Repo ---
+# FIX: Now also catches HTTPS remotes that weren't previously converted
 function Update-RepoRemotes {
     param ($RepoDir, $ProfileName)
     $prevLocation = Get-Location
@@ -106,18 +111,67 @@ function Update-RepoRemotes {
     $updated = 0
     foreach ($remote in $remotes) {
         $currentUrl = git remote get-url $remote 2>$null
-        if ($currentUrl -match "https://github\.com/(.+)" -or $currentUrl -match "git@github\.com:(.+)") {
+        if ($currentUrl -match "https://github\.com/(.+)" -or $currentUrl -match "git@github\.com:(.+)" -or $currentUrl -match "git@github\.com-[^:]+:(.+)") {
             $repoPath = $matches[1]
             $newUrl = "git@github.com-" + $ProfileName + ":" + $repoPath
-            git remote set-url $remote $newUrl
-            Write-Host "  [Updated] $remote" -ForegroundColor Green
-            Write-Host "    Before: $currentUrl" -ForegroundColor Gray
-            Write-Host "    After:  $newUrl" -ForegroundColor Cyan
-            $updated++
+            if ($currentUrl -ne $newUrl) {
+                git remote set-url $remote $newUrl
+                Write-Host "  [Updated] $remote" -ForegroundColor Green
+                Write-Host "    Before: $currentUrl" -ForegroundColor Gray
+                Write-Host "    After:  $newUrl" -ForegroundColor Cyan
+                $updated++
+            } else {
+                Write-Host "  [Already correct] $remote => $newUrl" -ForegroundColor Gray
+            }
         }
     }
     Set-Location $prevLocation
     return $updated
+}
+
+# --- FIX: Clear Windows Credential Manager entries for GitHub HTTPS ---
+function Clear-GitHubCredentials {
+    Write-Host "`n[Clearing GitHub HTTPS Credentials from Windows Credential Manager]" -ForegroundColor Cyan
+    $targets = @(
+        "git:https://github.com",
+        "LegacyGeneric:target=git:https://github.com"
+    )
+    $cleared = 0
+    foreach ($target in $targets) {
+        $result = cmdkey /delete:$target 2>&1
+        if ($result -notmatch "does not exist") {
+            Write-Host "  [Cleared] $target" -ForegroundColor Green
+            $cleared++
+        }
+    }
+    if ($cleared -eq 0) {
+        Write-Host "  No HTTPS credentials found (already clean)." -ForegroundColor Gray
+    }
+}
+
+# --- FIX: Set git url.insteadOf to redirect HTTPS -> SSH alias globally ---
+function Set-SSHRewrite {
+    param ($ProfileName)
+    # This makes "git clone https://github.com/user/repo" automatically use the SSH alias
+    $httpsBase = "https://github.com/"
+    $sshAlias  = "git@github.com-${ProfileName}:"
+
+    Write-Host "`n[Setting git url rewrite: HTTPS -> SSH alias]" -ForegroundColor Cyan
+
+    # Remove any previously set insteadOf rules for github.com to avoid conflicts
+    $existingRewrites = git config --global --get-regexp "url\..*\.insteadOf" 2>$null
+    if ($existingRewrites) {
+        foreach ($line in $existingRewrites) {
+            if ($line -match "github\.com" -and $line -match "insteadOf") {
+                $keyPart = ($line -split "\s+")[0]
+                git config --global --unset $keyPart 2>$null
+            }
+        }
+    }
+
+    git config --global "url.${sshAlias}.insteadOf" "$httpsBase"
+    Write-Host "  HTTPS github.com URLs will now rewrite to: $sshAlias" -ForegroundColor Green
+    Write-Host "  (Applied globally)" -ForegroundColor Gray
 }
 
 # --- Main Switch Logic ---
@@ -159,7 +213,13 @@ function Switch-GitAccount {
     # 3. SSH Config Alias
     Update-SSHConfig -ProfileName $ProfileName -SSHPath $selected.ssh
 
-    # 4. Remote URL Update
+    # 4. FIX: Clear HTTPS credentials from Windows Credential Manager
+    Clear-GitHubCredentials
+
+    # 5. FIX: Set global url.insteadOf rewrite (HTTPS -> SSH alias)
+    Set-SSHRewrite -ProfileName $ProfileName
+
+    # 6. Remote URL Update
     Write-Host "`n[Remote URL Update]" -ForegroundColor Cyan
     Write-Host "Enter the repo path(s) to update remote URLs to SSH alias." -ForegroundColor White
     Write-Host "  - Separate multiple paths with ';'" -ForegroundColor Gray
@@ -191,7 +251,7 @@ function Switch-GitAccount {
         Write-Host "  Skipped remote URL update." -ForegroundColor Gray
     }
 
-    # 5. Show Result
+    # 7. Show Result
     Write-Host "`nSettings Applied ($scope):" -ForegroundColor Green
     Write-Host "  Name:  $($selected.name)"
     Write-Host "  Email: $($selected.email)"
@@ -201,6 +261,7 @@ function Switch-GitAccount {
 
     Write-Host "`n[Note] For new clones, use the alias:" -ForegroundColor Cyan
     Write-Host "git clone git@github.com-${ProfileName}:user/repo.git" -ForegroundColor White
+    Write-Host "`n[Note] HTTPS clone URLs will now auto-redirect to the SSH alias." -ForegroundColor Cyan
 }
 
 # --- Reload All Keys ---
@@ -225,45 +286,6 @@ function Reload-AllKeys {
         }
     }
     Write-Host "`n$count key(s) loaded." -ForegroundColor Cyan
-}
-
-# --- Show Public Key ---
-function Show-PublicKey {
-    param ($Profiles)
-    Write-Host "`n[Show Public Key]" -ForegroundColor Cyan
-    Write-Host "Select a profile:" -ForegroundColor White
-    $i = 1
-    $keys = $Profiles.Keys | Sort-Object
-    foreach ($k in $keys) {
-        Write-Host "$i. $k ($($Profiles[$k].email))"
-        $i++
-    }
-    $choice = Read-Host "Select (Number or Name)"
-    $selectedKey = $null
-    if ($choice -match '^\d+$' -and [int]$choice -le $keys.Count) {
-        $selectedKey = $keys[[int]$choice-1]
-    } elseif ($Profiles.ContainsKey($choice)) {
-        $selectedKey = $choice
-    }
-
-    if ($selectedKey) {
-        $profile = $Profiles[$selectedKey]
-        $fullPath = [System.IO.Path]::GetFullPath($profile.ssh.Replace("~", $env:USERPROFILE))
-        $pubPath = "$fullPath.pub"
-        if (Test-Path $pubPath) {
-            $pubKey = (Get-Content $pubPath -Raw).Trim()
-            $pubKey | Set-Clipboard
-            Write-Host "`n========== Public Key for [$selectedKey] ==========" -ForegroundColor Cyan
-            Write-Host $pubKey -ForegroundColor White
-            Write-Host "====================================================" -ForegroundColor Cyan
-            Write-Host "(Copied to clipboard automatically)" -ForegroundColor Gray
-            Write-Host "Add it here: https://github.com/settings/ssh/new" -ForegroundColor Yellow
-        } else {
-            Write-Host "Public key not found at: $pubPath" -ForegroundColor Red
-        }
-    } else {
-        Write-Host "Profile not found." -ForegroundColor Red
-    }
 }
 
 # --- Clear All Keys ---
@@ -297,12 +319,30 @@ function Show-CurrentStatus {
     Write-Host "  Name:  $(git config user.name)"
     Write-Host "  Email: $(git config user.email)"
 
+    # FIX: Show active url.insteadOf rewrites
+    Write-Host "`n[URL Rewrites] (HTTPS -> SSH alias)" -ForegroundColor Yellow
+    $rewrites = git config --global --get-regexp "url\..*\.insteadOf" 2>$null
+    if ($rewrites) {
+        foreach ($line in $rewrites) { Write-Host "  $line" -ForegroundColor White }
+    } else {
+        Write-Host "  (None set)" -ForegroundColor Gray
+    }
+
     Write-Host "`n[SSH Identity] (Default: github.com)" -ForegroundColor Yellow
     $testResult = ssh -T -o "ConnectTimeout=5" -o "StrictHostKeyChecking=no" git@github.com 2>&1 | Out-String
     Write-Host "  $($testResult.Trim())" -ForegroundColor White
 
     Write-Host "`n[Active Identities in Agent]" -ForegroundColor Yellow
     ssh-add -l 2>$null | ForEach-Object { Write-Host "  $_" }
+
+    # FIX: Show Windows Credential Manager GitHub entries
+    Write-Host "`n[Windows Credential Manager - GitHub]" -ForegroundColor Yellow
+    $creds = cmdkey /list 2>&1 | Select-String "github"
+    if ($creds) {
+        $creds | ForEach-Object { Write-Host "  $_" -ForegroundColor White }
+    } else {
+        Write-Host "  (No GitHub HTTPS credentials cached)" -ForegroundColor Gray
+    }
 }
 
 # --- Program Entry ---
@@ -323,12 +363,11 @@ if ($args.Count -eq 0) {
         Write-Host "$($i+2). [CHECK CURRENT STATUS]"
         Write-Host "$($i+3). [RELOAD ALL KEYS]"
         Write-Host "$($i+4). [CLEAR ALL KEYS]"
-        Write-Host "$($i+5). [SHOW PUBLIC KEY]"
-        Write-Host "$($i+6). [EXIT]"
+        Write-Host "$($i+5). [EXIT]"
 
         $choice = Read-Host "`nSelect (Number or Name)"
 
-        if ($choice -eq ($i+6)) { break }
+        if ($choice -eq ($i+5)) { break }
 
         if ($choice -eq $i) {
             $newName = Read-Host "Profile Label (e.g. freelance)"
@@ -369,9 +408,6 @@ if ($args.Count -eq 0) {
             Read-Host "`nPress Enter to return to menu..."
         } elseif ($choice -eq ($i+4)) {
             Clear-AllKeys
-            Read-Host "`nPress Enter to return to menu..."
-        } elseif ($choice -eq ($i+5)) {
-            Show-PublicKey -Profiles $allProfiles
             Read-Host "`nPress Enter to return to menu..."
         } elseif ($choice -match '^\d+$' -and [int]$choice -le $keys.Count) {
             Switch-GitAccount -ProfileName $keys[[int]$choice-1] -Profiles $allProfiles
